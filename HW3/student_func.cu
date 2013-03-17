@@ -79,9 +79,115 @@
 
 */
 
+#include <stdio.h>
 
 #include "reference_calc.cpp"
 #include "utils.h"
+
+__global__
+void cdf(unsigned int * const d_cdf,
+         const int numBins)
+{
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    int step = 1;
+    while(step < numBins) {
+        if(idx % (step*2) == 0 && (numBins-1-idx - step) < numBins) {
+            d_cdf[numBins-1-idx] += d_cdf[numBins-1-idx - step];
+        }
+        step *= 2;
+        __syncthreads();
+    }
+
+    step /= 2;
+    if(idx == numBins -1) {
+        d_cdf[idx] = 0;
+    }
+    __syncthreads();
+
+    while(step) {
+        if(idx % (step*2) == 0 && numBins-1-idx - step < numBins) {
+            int tmp = d_cdf[numBins-1-idx];
+            d_cdf[numBins-1-idx] += d_cdf[numBins-1-idx - step];
+            d_cdf[numBins-1-idx - step] = tmp;
+        }
+        step /= 2;
+        __syncthreads();
+    }
+
+}
+
+__global__
+void histogram(const float * const d_logLuminance,
+               unsigned int * const d_hist,
+               const float lumMin,
+               const float lumRange,
+               const int numBins,
+               const size_t N)
+{
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(idx < numBins) {
+        d_hist[idx] = 0;
+    }
+    
+    __syncthreads();
+    
+    if(idx < N) {
+        size_t bin = min(static_cast<unsigned int>(numBins - 1),
+                           static_cast<unsigned int>((d_logLuminance[idx] - lumMin) / lumRange * numBins));
+        atomicAdd(&d_hist[bin], 1);
+    }
+}
+
+__global__
+void findMinAndMax(const float * const d_logLuminance,
+                   float * const d_work,
+                   const size_t N)
+{
+    // calculate min/max in block
+    size_t idx = threadIdx.x;
+    const float * const d_base = &d_logLuminance[blockIdx.x * blockDim.x];
+    float * const d_workbase = &d_work[blockIdx.x * blockDim.x];
+    size_t BN = blockIdx.x == gridDim.x-1 ? N % blockDim.x : blockDim.x;
+
+    int step = 1;
+    
+    // unrolling for step == 1, combined min-max
+    if(idx % 2 == 0) {
+        if(idx + step < BN && d_base[idx] > d_base[idx+step]) {
+            d_workbase[idx] = d_base[idx+step];
+            d_workbase[idx+step] = d_base[idx];
+        } else {
+            d_workbase[idx] = d_base[idx];
+            if(idx + step < BN) {
+                d_workbase[idx+step] = d_base[idx+step];
+            }
+        }
+    }
+    step *= 2;
+    __syncthreads();
+
+    while(step < BN) {
+        if(idx % (step*2) == 0 && idx < BN) {
+            // calculate minimum
+            if(idx + step < BN && d_workbase[idx] > d_workbase[idx+step]) {
+                d_workbase[idx] = d_workbase[idx+step];
+            }
+        }
+        
+        if((idx-1) % (step*2) == 0 && idx < BN) {
+            // calculate maximum
+            size_t cmpIdx = idx + step == BN ? idx + step - 1 : idx + step;
+            if(cmpIdx < BN && d_workbase[idx] < d_workbase[cmpIdx]) {
+                d_workbase[idx] = d_workbase[cmpIdx];
+            }
+        }
+        step *= 2;
+        __syncthreads();
+    }
+    
+ }
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -91,6 +197,45 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   const size_t numCols,
                                   const size_t numBins)
 {
+    const dim3 blockSize (1024, 1, 1);
+    const size_t elemCount = numRows * numCols;
+    const dim3 gridSize (elemCount/blockSize.x + ((elemCount%blockSize.x) == 0 ? 0 : 1), 1, 1);
+    
+    float * d_work;
+    checkCudaErrors(cudaMalloc(&d_work, sizeof(float) * elemCount));
+    
+    findMinAndMax<<<gridSize, blockSize>>>(d_logLuminance, d_work, elemCount);
+    
+    // min/max are in start of blocks
+    float * h_work = new float[elemCount];
+    cudaMemcpy(h_work, d_work, sizeof(float)*elemCount, cudaMemcpyDeviceToHost);
+    cudaFree(d_work);
+    
+    // serial look for block start
+    min_logLum = h_work[0];
+    max_logLum = h_work[1];
+    for(int i = 1024; i < elemCount; i++) {
+        min_logLum = min(min_logLum, h_work[i]);
+        max_logLum = max(max_logLum, h_work[i+1]);
+    }
+    
+    //printf("min %f  max %f\n", min_logLum, max_logLum);
+    float lumRange = max_logLum - min_logLum;
+    
+    delete [] h_work;
+    
+    histogram<<<gridSize, blockSize>>>(d_logLuminance, d_cdf, min_logLum, lumRange, numBins, elemCount);
+    cdf<<<1,numBins>>>(d_cdf, numBins);
+
+    /*
+    unsigned int * h_hist = new unsigned int[numBins];
+    cudaMemcpy(h_hist, d_cdf, sizeof(unsigned int)*numBins, cudaMemcpyDeviceToHost);
+    for(int i = 0; i < numBins; i++) {
+        printf("%u\n", h_hist[i]);
+    }
+    delete [] h_hist;
+    */
+    
   //TODO
   /*Here are the steps you need to implement
     1) find the minimum and maximum value in the input logLuminance channel
@@ -101,34 +246,4 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
-
-
-
-
-  /****************************************************************************
-  * You can use the code below to help with debugging, but make sure to       *
-  * comment it out again before submitting your assignment for grading,       *
-  * otherwise this code will take too much time and make it seem like your    *
-  * GPU implementation isn't fast enough.                                     *
-  *                                                                           *
-  * This code generates a reference cdf on the host by running the            *
-  * reference calculation we have given you.  It then copies your GPU         *
-  * generated cdf back to the host and calls a function that compares the     *
-  * the two and will output the first location they differ.                   *
-  * ************************************************************************* */
-
-  /* float *h_logLuminance = new float[numRows * numCols];
-  unsigned int *h_cdf   = new unsigned int[numBins];
-  unsigned int *h_your_cdf = new unsigned int[numBins];
-  checkCudaErrors(cudaMemcpy(h_logLuminance, d_logLuminance, numCols * numRows * sizeof(float), cudaMemcpyDeviceToHost));
-  checkCudaErrors(cudaMemcpy(h_your_cdf, d_cdf, numBins * sizeof(unsigned int), cudaMemcpyDeviceToHost));
-
-  referenceCalculation(h_logLuminance, h_cdf, numRows, numCols, numBins);
-
-  //compare the results of the CDF
-  checkResultsExact(h_cdf, h_your_cdf, numBins);
- 
-  delete[] h_logLuminance;
-  delete[] h_cdf; 
-  delete[] h_your_cdf; */
 }
