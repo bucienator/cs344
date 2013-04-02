@@ -43,17 +43,22 @@
 
  */
 
-#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, char *file, int line, bool abort=true)
+__device__ inline unsigned int max2(unsigned int a, unsigned int b)
 {
-   if (code != cudaSuccess) 
-   {
-      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
+    return a > b ? a : b;
 }
 
+__device__ inline unsigned int min2(unsigned int a, unsigned int b)
+{
+    return a < b ? a : b;
+}
 
+__device__ inline unsigned int add2(unsigned int a, unsigned int b)
+{
+    return a + b;
+}
+
+template <unsigned int(*func)(unsigned int, unsigned int)>
 __global__
 void exclusive_scan_add_carry(unsigned int * const d_data, const size_t numElems, const unsigned int * const d_carry)
 {
@@ -61,10 +66,11 @@ void exclusive_scan_add_carry(unsigned int * const d_data, const size_t numElems
 	unsigned int * const blockStart = d_data + blockIdx.x * blockDim.x;
 
 	if(fullIdx < numElems)
-		blockStart[threadIdx.x] += d_carry[blockIdx.x];
+		blockStart[threadIdx.x] = func(blockStart[threadIdx.x], d_carry[blockIdx.x]);
 }
 
 
+template <unsigned int(*func)(unsigned int, unsigned int), unsigned int zero>
 __global__
 void exclusive_scan_block(unsigned int * const d_data, const size_t numElems, unsigned int * const d_carry)
 {
@@ -76,7 +82,7 @@ void exclusive_scan_block(unsigned int * const d_data, const size_t numElems, un
 	if(fullIdx < numElems)
 		s_block[threadIdx.x] = blockStart[threadIdx.x];
 	else
-		s_block[threadIdx.x] = 0;
+		s_block[threadIdx.x] = zero;
 
 	if(threadIdx.x == blockDim.x-1) {
 		d_carry[blockIdx.x] = s_block[threadIdx.x];
@@ -88,21 +94,21 @@ void exclusive_scan_block(unsigned int * const d_data, const size_t numElems, un
 
 	while(step < blockDim.x) {
 		if(threadIdx.x % (step * 2) == 0 && (threadIdx.x + step) < blockDim.x) {
-			s_block[blockDim.x - 1 - threadIdx.x] += s_block[blockDim.x - 1 - threadIdx.x - step];
+			s_block[blockDim.x - 1 - threadIdx.x] = func(s_block[blockDim.x - 1 - threadIdx.x], s_block[blockDim.x - 1 - threadIdx.x - step]);
 		}
 		step *= 2;
 
 		__syncthreads();
 	}
 
-	s_block[blockDim.x - 1] = 0;
+	s_block[blockDim.x - 1] = zero;
 	__syncthreads();
 
 	do {
 		step /= 2;
 		if(threadIdx.x % (step * 2) == 0 && (threadIdx.x + step) < blockDim.x) {
 			unsigned int temp = s_block[blockDim.x - 1 - threadIdx.x];
-			s_block[blockDim.x - 1 - threadIdx.x] += s_block[blockDim.x - 1 - threadIdx.x - step];
+			s_block[blockDim.x - 1 - threadIdx.x] = func(s_block[blockDim.x - 1 - threadIdx.x], s_block[blockDim.x - 1 - threadIdx.x - step]);
 			s_block[blockDim.x - 1 - threadIdx.x - step] = temp;
 		}
 		__syncthreads();
@@ -112,12 +118,13 @@ void exclusive_scan_block(unsigned int * const d_data, const size_t numElems, un
 		blockStart[threadIdx.x] = s_block[threadIdx.x];
 
 	if(threadIdx.x == blockDim.x-1) {
-		d_carry[blockIdx.x] += s_block[threadIdx.x];
+		d_carry[blockIdx.x] = func(d_carry[blockIdx.x], s_block[threadIdx.x]);
 	}
 
 }
 
 
+template <unsigned int(*func)(unsigned int, unsigned int), unsigned int zero>
 void exclusive_scan(unsigned int * d_data, const size_t numElems)
 {
 	const dim3 blockSize (1024, 1, 1);
@@ -128,16 +135,16 @@ void exclusive_scan(unsigned int * d_data, const size_t numElems)
 	checkCudaErrors(cudaMalloc(&d_carry, gridSize.x * sizeof(unsigned int)));
 
 	// scan blocks
-	exclusive_scan_block<<<gridSize, blockSize, blockSize.x*sizeof(unsigned int)>>>(d_data, numElems, d_carry);
+	exclusive_scan_block<func, zero> <<<gridSize, blockSize, blockSize.x*sizeof(unsigned int)>>>(d_data, numElems, d_carry);
 	//gpuErrchk( cudaPeekAtLastError() );
 	//gpuErrchk( cudaDeviceSynchronize() );
 
 	// recursive scan carry
 	if(gridSize.x > 1) {
-		exclusive_scan(d_carry, gridSize.x);
+		exclusive_scan<func, zero> (d_carry, gridSize.x);
 
 		// add carry
-		exclusive_scan_add_carry<<<gridSize, blockSize>>>(d_data, numElems, d_carry);
+		exclusive_scan_add_carry<func> <<<gridSize, blockSize>>>(d_data, numElems, d_carry);
 		//gpuErrchk( cudaPeekAtLastError() );
 		//gpuErrchk( cudaDeviceSynchronize() );
 	}
@@ -192,7 +199,7 @@ void radix_sort_scatter(const unsigned int* const d_inputVals,
 
 }
 
-
+#include<stdio.h>
 void your_sort(unsigned int* const d_inputVals,
 			   unsigned int* const d_inputPos,
 			   unsigned int* const d_outputVals,
@@ -226,7 +233,9 @@ void your_sort(unsigned int* const d_inputVals,
 						&h_outputVals[0], &h_outputPos[0],
 						numElems);
   */
-	const unsigned int baseBitIncrement = 4;
+
+    
+    const unsigned int baseBitIncrement = 4;
 	const unsigned int selectorMask = (1 << baseBitIncrement) - 1;
 
 	unsigned int * d_selectors;
@@ -235,6 +244,27 @@ void your_sort(unsigned int* const d_inputVals,
 	const dim3 blockSizeAssign (1024, 1, 1);
 	const dim3 gridSizeAssign (numElems/blockSizeAssign.x + ((numElems%blockSizeAssign.x) == 0 ? 0 : 1), 1, 1);
 
+/*
+    // check values
+    // host
+    thrust::host_vector<unsigned int> h_inputVals(thrust::device_ptr<unsigned int>(d_inputVals),
+												thrust::device_ptr<unsigned int>(d_inputVals) + numElems);
+    std::sort(h_inputVals.begin(), h_inputVals.end());
+    unsigned int hmax = h_inputVals.front();
+    printf("%u\n", hmax);
+    
+    // device
+    unsigned int * d_work;
+	checkCudaErrors(cudaMalloc(&d_work, numElems * sizeof(unsigned int)));
+    checkCudaErrors(cudaMemcpy(d_work, d_inputVals, numElems * sizeof(unsigned int), cudaMemcpyDeviceToDevice));
+    exclusive_scan<min2, UINT_MAX>(d_work, numElems);
+    unsigned int value;
+    checkCudaErrors(cudaMemcpy(&value, d_work+numElems-1, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    cudaDeviceSynchronize();
+    cudaFree(d_work);
+    printf("%u\n", value);
+*/         
+    
 	unsigned int * values[] = {d_inputVals, d_outputVals};
 	unsigned int * pos[] = {d_inputPos, d_outputPos};
 	int target = 1;
@@ -260,7 +290,7 @@ void your_sort(unsigned int* const d_inputVals,
 			}
 		}*/
 
-		exclusive_scan(d_selectors, (selectorMask+1) * numElems);
+		exclusive_scan<add2, 0>(d_selectors, (selectorMask+1) * numElems);
 		/*{
 			thrust::host_vector<unsigned int> h_test(thrust::device_ptr<unsigned int>(d_selectors), thrust::device_ptr<unsigned int>(d_selectors + (selectorMask+1) * numElems));
 			unsigned int lastValue = 0;
@@ -286,7 +316,7 @@ void your_sort(unsigned int* const d_inputVals,
 
 	if(target != 0) {
 		// need to copy data
-		checkCudaErrors(cudaMemcpy(d_outputVals, d_inputVals, numElems * sizeof(unsigned int), cudaMemcpyDeviceToDevice));
+		//checkCudaErrors(cudaMemcpy(d_outputVals, d_inputVals, numElems * sizeof(unsigned int), cudaMemcpyDeviceToDevice));
 		checkCudaErrors(cudaMemcpy(d_outputPos, d_inputPos, numElems * sizeof(unsigned int), cudaMemcpyDeviceToDevice));
 	}
 
@@ -297,7 +327,7 @@ void your_sort(unsigned int* const d_inputVals,
    * result and the reference.                                               *
    **************************************************************************/
 
-  /*
+/*  
   thrust::host_vector<unsigned int> h_yourOutputVals(thrust::device_ptr<unsigned int>(d_outputVals),
 													 thrust::device_ptr<unsigned int>(d_outputVals) + numElems);
   thrust::host_vector<unsigned int> h_yourOutputPos(thrust::device_ptr<unsigned int>(d_outputPos),
