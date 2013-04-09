@@ -100,7 +100,6 @@
 
 //****************************************************************************
 
-#include "reference_calc.cpp"
 #include "utils.h"
 
 #define BLOCK_HEIGHT 32

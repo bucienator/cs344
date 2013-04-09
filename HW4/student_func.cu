@@ -1,7 +1,6 @@
 //Udacity HW 4
 //Radix Sorting
 
-#include "reference_calc.cpp"
 #include "utils.h"
 #include <thrust/host_vector.h>
 
