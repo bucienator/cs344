@@ -28,27 +28,49 @@
 #include "utils.h"
 
 __global__
-void yourHisto(const unsigned int* const vals, //INPUT
-               unsigned int* const histo,      //OUPUT
-               int numVals)
+void histoClear(unsigned int * const histo,
+				const unsigned int numBins)
 {
-  //TODO fill in this kernel to calculate the histogram
-  //as quickly as possible
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  //Although we provide only one kernel skeleton,
-  //feel free to use more if it will help you
-  //write faster code
+  if(idx < numBins) {
+	  histo[idx] = 0;
+  }
+}
+
+__global__
+void yourHisto(const unsigned int* const vals, //INPUT
+			   unsigned int* const histo,      //OUPUT
+			   const unsigned int numBins,
+			   const unsigned int numElems)
+{
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if(idx < numElems) {
+	  unsigned int value = vals[idx];
+	  atomicAdd(&histo[value], 1);
+  }
+
 }
 
 void computeHistogram(const unsigned int* const d_vals, //INPUT
-                      unsigned int* const d_histo,      //OUTPUT
-                      const unsigned int numBins,
-                      const unsigned int numElems)
+					  unsigned int* const d_histo,      //OUTPUT
+					  const unsigned int numBins,
+					  const unsigned int numElems)
 {
-  //TODO Launch the yourHisto kernel
+	{
+		dim3 blockDim(1024);
+		dim3 gridDim(numBins/blockDim.x + (numBins % blockDim.x == 0 ? 0 : 1) );
 
-  //if you want to use/launch more than one kernel,
-  //feel free
+		histoClear<<<gridDim, blockDim>>>(d_histo, numBins);
+	}
 
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+	{
+		dim3 blockDim(1024);
+		dim3 gridDim(numElems/blockDim.x + (numElems % blockDim.x == 0 ? 0 : 1) );
+
+		yourHisto<<<gridDim, blockDim>>>(d_vals, d_histo, numBins, numElems);
+	}
+
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 }
