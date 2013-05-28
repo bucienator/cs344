@@ -24,6 +24,7 @@ if(CUDA_FOUND)
 
     # add -Wextra compiler flag for gcc compilations
     if (UNIX)
+	set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS} "-Xcompiler -Wall;")
 	set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS} "-Xcompiler -Wextra")
     endif (UNIX)
 
